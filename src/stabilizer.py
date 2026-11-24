@@ -16,6 +16,7 @@ class FilmStabilizer:
     def __init__(self, cl_mgr: OpenCLManager, smoothing_radius: int = 20):
         self.cl_mgr = cl_mgr
         self.program = cl_mgr.load_program("stabilize.cl")
+        self.warp_kernel = cl.Kernel(self.program, "warp_affine_bilinear")
         self.smoothing_radius = smoothing_radius
 
     @staticmethod
@@ -59,7 +60,6 @@ class FilmStabilizer:
                         prev_pts[valid], curr_pts[valid], method=cv2.RANSAC, ransacReprojThreshold=1.5
                     )
                     if mat is not None:
-                        # Enforce pure rigid transform (rotation + translation, scale = 1)
                         da = np.arctan2(mat[1, 0], mat[0, 0])
                         H[0, 0] = np.cos(da)
                         H[0, 1] = -np.sin(da)
@@ -97,12 +97,10 @@ class FilmStabilizer:
         height, width = frames[0].shape
         pairwise = self._estimate_pairwise_matrices(frames)
 
-        # Accumulate global camera poses C_i relative to frame 0 (around origin (0, 0))
         poses = [np.eye(3, dtype=np.float64)]
         for H in pairwise:
             poses.append(H @ poses[-1])
 
-        # Extract (tx, ty, angle) around origin (0, 0)
         trajectory = np.zeros((len(frames), 3), dtype=np.float64)
         for idx, C in enumerate(poses):
             trajectory[idx, 0] = C[0, 2]
@@ -110,7 +108,6 @@ class FilmStabilizer:
             trajectory[idx, 2] = np.arctan2(C[1, 0], C[0, 0])
 
         smoothed_traj = self._smooth_trajectory(trajectory)
-        print(f"Max detected jitter amplitude: dx={np.ptp(trajectory[:, 0]):.2f}px, dy={np.ptp(trajectory[:, 1]):.2f}px")
 
         ctx = self.cl_mgr.ctx
         queue = self.cl_mgr.queue
@@ -124,7 +121,6 @@ class FilmStabilizer:
         total_gpu_ns = 0
 
         for idx, frame in enumerate(frames):
-            # Build smoothed pose C_smooth around (0, 0)
             stx, sty, sa = smoothed_traj[idx]
             C_smooth = np.array([
                 [np.cos(sa), -np.sin(sa), stx],
@@ -132,12 +128,10 @@ class FilmStabilizer:
                 [0.0,         0.0,        1.0],
             ], dtype=np.float64)
 
-            # Forward stabilizing transform S = C_smooth @ inv(C_raw)
-            # Kernel expects inverse mapping inv(S) = C_raw @ inv(C_smooth)
             inv_S = (poses[idx] @ np.linalg.inv(C_smooth)).astype(np.float32)
 
             cl.enqueue_copy(queue, src_buf, np.ascontiguousarray(frame))
-            event = self.program.warp_affine_bilinear(
+            event = self.warp_kernel(
                 queue,
                 (width, height),
                 None,

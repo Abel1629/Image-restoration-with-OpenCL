@@ -18,6 +18,8 @@ class FilmDeflicker:
     def __init__(self, cl_mgr: OpenCLManager, tile_size: int = 32, temporal_radius: int = 8):
         self.cl_mgr = cl_mgr
         self.program = cl_mgr.load_program("deflicker.cl")
+        self.stats_kernel = cl.Kernel(self.program, "compute_tile_stats")
+        self.apply_kernel = cl.Kernel(self.program, "apply_deflicker")
         self.tile_size = tile_size
         self.temporal_radius = temporal_radius
 
@@ -67,13 +69,12 @@ class FilmDeflicker:
         all_stds = np.empty((num_frames, grid_h, grid_w), dtype=np.float32)
         total_gpu_ns = 0
 
-        # Pass 1: Extract per-tile mean and std on GPU
         local_size = (16, 16)
         global_size_stats = (grid_w * local_size[0], grid_h * local_size[1])
 
         for idx, frame in enumerate(frames):
             cl.enqueue_copy(queue, img_buf, np.ascontiguousarray(frame))
-            ev = self.program.compute_tile_stats(
+            ev = self.stats_kernel(
                 queue,
                 global_size_stats,
                 local_size,
@@ -92,7 +93,6 @@ class FilmDeflicker:
             cl.enqueue_copy(queue, all_means[idx], means_buf).wait()
             cl.enqueue_copy(queue, all_stds[idx], stds_buf).wait()
 
-        # Compute temporally stabilized target tile statistics + light spatial smoothing
         target_means = self._temporal_smooth_3d(all_means, self.temporal_radius)
         target_stds = self._temporal_smooth_3d(all_stds, self.temporal_radius)
 
@@ -100,11 +100,9 @@ class FilmDeflicker:
             target_means[idx] = cv2.GaussianBlur(target_means[idx], (3, 3), 0.8)
             target_stds[idx] = cv2.GaussianBlur(target_stds[idx], (3, 3), 0.8)
 
-        # Compute bounded gain and offset per tile to avoid amplifying noise in flat regions
         gains = np.clip(target_stds / np.maximum(all_stds, 6.0), 0.72, 1.38).astype(np.float32)
         offsets = (target_means - gains * all_means).astype(np.float32)
 
-        # Pass 2: Apply bilinearly interpolated gain & offset per pixel on GPU
         dst_buf = cl.Buffer(ctx, mf.WRITE_ONLY, size=width * height)
         gain_buf = cl.Buffer(ctx, mf.READ_ONLY, size=num_tiles * 4)
         offset_buf = cl.Buffer(ctx, mf.READ_ONLY, size=num_tiles * 4)
@@ -115,7 +113,7 @@ class FilmDeflicker:
             cl.enqueue_copy(queue, gain_buf, np.ascontiguousarray(gains[idx]))
             cl.enqueue_copy(queue, offset_buf, np.ascontiguousarray(offsets[idx]))
 
-            ev = self.program.apply_deflicker(
+            ev = self.apply_kernel(
                 queue,
                 (width, height),
                 None,
