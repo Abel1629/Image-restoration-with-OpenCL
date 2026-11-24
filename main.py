@@ -30,7 +30,7 @@ def run_opencl_pipeline(
     mgr = OpenCLManager(prefer_vendor=prefer_vendor, enable_profiling=True)
 
     stabilizer = FilmStabilizer(mgr, smoothing_radius=20)
-    deflicker = FilmDeflicker(mgr, tile_size=32, temporal_radius=8)
+    deflicker = FilmDeflicker(mgr, tile_size=48, temporal_radius=8)
     remover = DustAndScratchRemover(mgr)
 
     t0 = time.perf_counter()

@@ -1,235 +1,44 @@
-inline float sample_bilinear(__global const uchar* img, float fx, float fy, int width, int height) {
-    fx = clamp(fx, 0.0f, (float)(width - 1));
-    fy = clamp(fy, 0.0f, (float)(height - 1));
-
-    int x0 = (int)floor(fx);
-    int y0 = (int)floor(fy);
-    int x1 = min(x0 + 1, width - 1);
-    int y1 = min(y0 + 1, height - 1);
-
-    float wx = fx - (float)x0;
-    float wy = fy - (float)y0;
-
-    float p00 = (float)img[y0 * width + x0];
-    float p10 = (float)img[y0 * width + x1];
-    float p01 = (float)img[y1 * width + x0];
-    float p11 = (float)img[y1 * width + x1];
-
-    return mix(mix(p00, p10, wx), mix(p01, p11, wx), wy);
-}
-
-inline float patch_sad(
-    __global const uchar* img_a, int ax, int ay,
-    __global const uchar* img_b, int bx, int by,
-    int width, int height, int patch_radius
-) {
-    float sad = 0.0f;
-    for (int py = -patch_radius; py <= patch_radius; py++) {
-        int ya = clamp(ay + py, 0, height - 1);
-        int yb = clamp(by + py, 0, height - 1);
-        for (int px = -patch_radius; px <= patch_radius; px++) {
-            int xa = clamp(ax + px, 0, width - 1);
-            int xb = clamp(bx + px, 0, width - 1);
-            sad += fabs((float)img_a[ya * width + xa] - (float)img_b[yb * width + xb]);
-        }
-    }
-    return sad;
-}
-
-__kernel void estimate_block_motion(
-    __global const uchar* curr,
-    __global const uchar* ref,
-    __global short2* flow_out,
-    const int width,
-    const int height,
-    const int search_radius,
-    const int patch_radius
-) {
-    int x = get_global_id(0);
-    int y = get_global_id(1);
-    if (x >= width || y >= height) return;
-
-    float zero_cost = patch_sad(curr, x, y, ref, x, y, width, height, patch_radius);
-
-    // Fast early-exit for stationary background/building pixels (prevents false matches & boosts speed ~15x)
-    float patch_pixels = (float)((2 * patch_radius + 1) * (2 * patch_radius + 1));
-    if (zero_cost < patch_pixels * 5.5f) {
-        flow_out[y * width + x] = (short2)(0, 0);
-        return;
-    }
-
-    int best_dx = 0;
-    int best_dy = 0;
-    float best_cost = zero_cost * 0.65f;
-
-    for (int dy = -search_radius; dy <= search_radius; dy += 2) {
-        int ry = y + dy;
-        if (ry < patch_radius || ry >= height - patch_radius) continue;
-        for (int dx = -search_radius; dx <= search_radius; dx += 2) {
-            if (dx == 0 && dy == 0) continue;
-            int rx = x + dx;
-            if (rx < patch_radius || rx >= width - patch_radius) continue;
-
-            float sad = patch_sad(curr, x, y, ref, rx, ry, width, height, patch_radius)
-                      + 0.45f * (float)(abs(dx) + abs(dy));
-            if (sad < best_cost) {
-                best_cost = sad;
-                best_dx = dx;
-                best_dy = dy;
-            }
-        }
-    }
-
-    if (best_dx != 0 || best_dy != 0) {
-        int c_dx = best_dx;
-        int c_dy = best_dy;
-        for (int dy = c_dy - 1; dy <= c_dy + 1; dy++) {
-            int ry = y + dy;
-            if (ry < patch_radius || ry >= height - patch_radius) continue;
-            for (int dx = c_dx - 1; dx <= c_dx + 1; dx++) {
-                int rx = x + dx;
-                if (rx < patch_radius || rx >= width - patch_radius) continue;
-
-                float sad = patch_sad(curr, x, y, ref, rx, ry, width, height, patch_radius)
-                          + 0.45f * (float)(abs(dx) + abs(dy));
-                if (sad < best_cost) {
-                    best_cost = sad;
-                    best_dx = dx;
-                    best_dy = dy;
-                }
-            }
-        }
-    }
-
-    flow_out[y * width + x] = (short2)((short)best_dx, (short)best_dy);
-}
-
-__kernel void estimate_symmetric_motion(
+// Kernel 1: Identify true moving-object regions using |prev - next|
+// Single-frame dust blotches are absent in both prev and next, so |prev - next| is ~0 on dust
+// and high ONLY where genuine objects (car, wheels, pendulum) are moving!
+__kernel void compute_motion_mask(
     __global const uchar* prev_img,
     __global const uchar* next_img,
-    __global short2* sym_flow_out,
+    __global uchar* motion_mask,
     const int width,
     const int height,
-    const int search_radius,
-    const int patch_radius
+    const float motion_thresh
 ) {
     int x = get_global_id(0);
     int y = get_global_id(1);
     if (x >= width || y >= height) return;
 
-    float zero_cost = patch_sad(prev_img, x, y, next_img, x, y, width, height, patch_radius);
-
-    float patch_pixels = (float)((2 * patch_radius + 1) * (2 * patch_radius + 1));
-    if (zero_cost < patch_pixels * 5.5f) {
-        sym_flow_out[y * width + x] = (short2)(0, 0);
-        return;
-    }
-
-    int best_dx = 0;
-    int best_dy = 0;
-    float best_cost = zero_cost * 0.65f;
-
-    for (int dy = -search_radius; dy <= search_radius; dy += 2) {
-        if (y - dy < patch_radius || y - dy >= height - patch_radius) continue;
-        if (y + dy < patch_radius || y + dy >= height - patch_radius) continue;
-        for (int dx = -search_radius; dx <= search_radius; dx += 2) {
-            if (dx == 0 && dy == 0) continue;
-            if (x - dx < patch_radius || x - dx >= width - patch_radius) continue;
-            if (x + dx < patch_radius || x + dx >= width - patch_radius) continue;
-
-            float sad = patch_sad(prev_img, x - dx, y - dy, next_img, x + dx, y + dy, width, height, patch_radius)
-                      + 0.45f * (float)(abs(dx) + abs(dy));
-            if (sad < best_cost) {
-                best_cost = sad;
-                best_dx = dx;
-                best_dy = dy;
+    int diff_count = 0;
+    for (int dy = -3; dy <= 3; dy++) {
+        int ny = clamp(y + dy, 0, height - 1);
+        for (int dx = -3; dx <= 3; dx++) {
+            int nx = clamp(x + dx, 0, width - 1);
+            int n_idx = ny * width + nx;
+            if (fabs((float)prev_img[n_idx] - (float)next_img[n_idx]) > motion_thresh) {
+                diff_count++;
             }
         }
     }
 
-    if (best_dx != 0 || best_dy != 0) {
-        int c_dx = best_dx;
-        int c_dy = best_dy;
-        for (int dy = c_dy - 1; dy <= c_dy + 1; dy++) {
-            if (y - dy < patch_radius || y - dy >= height - patch_radius) continue;
-            if (y + dy < patch_radius || y + dy >= height - patch_radius) continue;
-            for (int dx = c_dx - 1; dx <= c_dx + 1; dx++) {
-                if (x - dx < patch_radius || x - dx >= width - patch_radius) continue;
-                if (x + dx < patch_radius || x + dx >= width - patch_radius) continue;
-
-                float sad = patch_sad(prev_img, x - dx, y - dy, next_img, x + dx, y + dy, width, height, patch_radius)
-                          + 0.45f * (float)(abs(dx) + abs(dy));
-                if (sad < best_cost) {
-                    best_cost = sad;
-                    best_dx = dx;
-                    best_dy = dy;
-                }
-            }
-        }
-    }
-
-    sym_flow_out[y * width + x] = (short2)((short)best_dx, (short)best_dy);
+    // Require at least 4 differing pixels in 7x7 so isolated random noise spikes don't trigger motion protection
+    motion_mask[y * width + x] = (diff_count >= 4) ? 255 : 0;
 }
 
-__kernel void detect_temporal_defects(
+// Kernel 2: Remove ALL dust blotches (outside motion_mask) + ALL vertical roller scratches
+__kernel void inpaint_defects(
     __global const uchar* prev_img,
     __global const uchar* curr_img,
     __global const uchar* next_img,
-    __global const short2* flow_prev,
-    __global const short2* flow_next,
-    __global const short2* flow_sym,
-    __global uchar* temporal_ref,
-    __global uchar* defect_mask,
-    const int width,
-    const int height,
-    const float dust_thresh,
-    const float neighbor_agree_thresh
-) {
-    int x = get_global_id(0);
-    int y = get_global_id(1);
-    if (x >= width || y >= height) return;
-
-    int idx = y * width + x;
-    float c_val = (float)curr_img[idx];
-
-    short2 fp = flow_prev[idx];
-    short2 fn = flow_next[idx];
-    float p_dir = sample_bilinear(prev_img, (float)(x + fp.x), (float)(y + fp.y), width, height);
-    float n_dir = sample_bilinear(next_img, (float)(x + fn.x), (float)(y + fn.y), width, height);
-
-    short2 fs = flow_sym[idx];
-    float p_sym = sample_bilinear(prev_img, (float)(x - fs.x), (float)(y - fs.y), width, height);
-    float n_sym = sample_bilinear(next_img, (float)(x + fs.x), (float)(y + fs.y), width, height);
-
-    float diff_dir = fabs(p_dir - n_dir);
-    float diff_sym = fabs(p_sym - n_sym);
-
-    float p_best = (diff_sym < diff_dir) ? p_sym : p_dir;
-    float n_best = (diff_sym < diff_dir) ? n_sym : n_dir;
-    float pair_diff = fmin(diff_dir, diff_sym);
-    float t_avg = 0.5f * (p_best + n_best);
-
-    temporal_ref[idx] = (uchar)clamp(round(t_avg), 0.0f, 255.0f);
-
-    float dev_p = c_val - p_best;
-    float dev_n = c_val - n_best;
-    bool same_sign = (dev_p * dev_n) > 0.0f;
-    float min_dev = fmin(fabs(dev_p), fabs(dev_n));
-
-    if (pair_diff < neighbor_agree_thresh && same_sign && min_dev > dust_thresh) {
-        defect_mask[idx] = 255;
-    } else {
-        defect_mask[idx] = 0;
-    }
-}
-
-__kernel void reconstruct_frame(
-    __global const uchar* curr_img,
-    __global const uchar* temporal_ref,
-    __global const uchar* defect_mask,
+    __global const uchar* motion_mask,
     __global uchar* dst_img,
     const int width,
     const int height,
+    const float dust_thresh,
     const float scratch_thresh
 ) {
     int x = get_global_id(0);
@@ -237,68 +46,141 @@ __kernel void reconstruct_frame(
     if (x >= width || y >= height) return;
 
     int idx = y * width + x;
+    float c = (float)curr_img[idx];
+    float p = (float)prev_img[idx];
+    float n = (float)next_img[idx];
+    float t_avg = 0.5f * (p + n);
 
-    bool is_dust_3x3 = false;
-    for (int dy = -1; dy <= 1; dy++) {
-        int ny = clamp(y + dy, 0, height - 1);
-        for (int dx = -1; dx <= 1; dx++) {
-            int nx = clamp(x + dx, 0, width - 1);
-            if (defect_mask[ny * width + nx] > 0) {
-                is_dust_3x3 = true;
+    // 1. Vertical roller scratch detection (21px vertical span, checks x-1, x, x+1 for 2px scratches)
+    bool is_scratch = false;
+    for (int offset = -1; offset <= 1; offset++) {
+        int cx = x + offset;
+        if (cx < 4 || cx >= width - 4) continue;
+
+        int consistent_rows = 0;
+        float contrast_sum = 0.0f;
+        for (int ky = -10; ky <= 10; ky += 2) {
+            int sy = clamp(y + ky, 0, height - 1);
+            float cy = (float)curr_img[sy * width + cx];
+            float l4 = (float)curr_img[sy * width + (cx - 4)];
+            float r4 = (float)curr_img[sy * width + (cx + 4)];
+            float diff = cy - 0.5f * (l4 + r4);
+            if (fabs(diff) > scratch_thresh && fabs(l4 - r4) < 22.0f) {
+                consistent_rows++;
+                contrast_sum += diff;
             }
         }
-    }
 
-    if (is_dust_3x3) {
-        int blob_area = 0;
-        for (int dy = -8; dy <= 8; dy++) {
-            int ny = clamp(y + dy, 0, height - 1);
-            for (int dx = -8; dx <= 8; dx++) {
-                int nx = clamp(x + dx, 0, width - 1);
-                if (defect_mask[ny * width + nx] > 0) {
-                    blob_area++;
-                }
-            }
-        }
+        float l4_now = (float)curr_img[y * width + (cx - 4)];
+        float r4_now = (float)curr_img[y * width + (cx + 4)];
+        float c_col = (float)curr_img[y * width + cx];
+        float diff_now = c_col - 0.5f * (l4_now + r4_now);
 
-        if (blob_area <= 95) {
-            dst_img[idx] = temporal_ref[idx];
-            return;
+        if (consistent_rows >= 8 && (diff_now * contrast_sum) > 0.0f && fabs(diff_now) > scratch_thresh * 0.65f) {
+            is_scratch = true;
         }
     }
 
-    int consistent_rows = 0;
-    float contrast_sum = 0.0f;
-
-    for (int ky = -8; ky <= 8; ky += 2) {
-        int sy = clamp(y + ky, 0, height - 1);
-        float c_y = (float)curr_img[sy * width + x];
-        float l3 = (float)curr_img[sy * width + max(x - 3, 0)];
-        float r3 = (float)curr_img[sy * width + min(x + 3, width - 1)];
-        float flank = 0.5f * (l3 + r3);
-        float diff = c_y - flank;
-
-        if (fabs(diff) > scratch_thresh && fabs(l3 - r3) < 20.0f) {
-            consistent_rows++;
-            contrast_sum += diff;
-        }
-    }
-
-    float l3_now = (float)curr_img[y * width + max(x - 3, 0)];
-    float r3_now = (float)curr_img[y * width + min(x + 3, width - 1)];
-    float c_now = (float)curr_img[idx];
-    float diff_now = c_now - 0.5f * (l3_now + r3_now);
-
-    if (consistent_rows >= 7 && (diff_now * contrast_sum) > 0.0f && fabs(diff_now) > scratch_thresh * 0.75f) {
-        float spatial_fill = 0.5f * (l3_now + r3_now);
-        float t_val = (float)temporal_ref[idx];
-        if (fabs(t_val - spatial_fill) < 16.0f) {
-            dst_img[idx] = (uchar)clamp(round(0.5f * (t_val + spatial_fill)), 0.0f, 255.0f);
+    if (is_scratch) {
+        float l4_here = (float)curr_img[y * width + max(x - 4, 0)];
+        float r4_here = (float)curr_img[y * width + min(x + 4, width - 1)];
+        float spatial_fill = 0.5f * (l4_here + r4_here);
+        if (motion_mask[idx] == 0 && fabs(t_avg - spatial_fill) < 16.0f) {
+            dst_img[idx] = (uchar)clamp(round(0.5f * (t_avg + spatial_fill)), 0.0f, 255.0f);
         } else {
             dst_img[idx] = (uchar)clamp(round(spatial_fill), 0.0f, 255.0f);
         }
         return;
     }
 
+    // 2. Dust blotch removal (including 1px dilated rim around blotches)
+    // Protected wherever motion_mask > 0 so car, wheels, and pendulum are NEVER touched
+    if (motion_mask[idx] == 0) {
+        bool near_dust = false;
+        for (int dy = -1; dy <= 1; dy++) {
+            int ny = clamp(y + dy, 0, height - 1);
+            for (int dx = -1; dx <= 1; dx++) {
+                int nx = clamp(x + dx, 0, width - 1);
+                int n_idx = ny * width + nx;
+                if (motion_mask[n_idx] == 0) {
+                    float nc = (float)curr_img[n_idx];
+                    float np = (float)prev_img[n_idx];
+                    float nn = (float)next_img[n_idx];
+                    if (fabs(np - nn) < 18.0f && ((nc - np) * (nc - nn) > 0.0f) &&
+                        fmin(fabs(nc - np), fabs(nc - nn)) > dust_thresh) {
+                        near_dust = true;
+                    }
+                }
+            }
+        }
+
+        if (near_dust && fabs(p - n) < 20.0f) {
+            dst_img[idx] = (uchar)clamp(round(t_avg), 0.0f, 255.0f);
+            return;
+        }
+    }
+
     dst_img[idx] = curr_img[idx];
+}
+
+// Kernel 3: Spatio-Temporal Bilateral Denoiser
+__kernel void spatiotemporal_bilateral(
+    __global const uchar* prev_img,
+    __global const uchar* curr_img,
+    __global const uchar* next_img,
+    __global uchar* dst_img,
+    const int width,
+    const int height,
+    const float sigma_spatial,
+    const float sigma_range
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    if (x >= width || y >= height) return;
+
+    int idx = y * width + x;
+    float center = (float)curr_img[idx];
+    float inv_2s2 = -0.5f / (sigma_spatial * sigma_spatial);
+    float inv_2r2 = -0.5f / (sigma_range * sigma_range);
+
+    float sum_w = 0.0f;
+    float sum_v = 0.0f;
+
+    // 1. Spatial 5x5 bilateral support on current frame
+    for (int dy = -2; dy <= 2; dy++) {
+        int ny = clamp(y + dy, 0, height - 1);
+        for (int dx = -2; dx <= 2; dx++) {
+            int nx = clamp(x + dx, 0, width - 1);
+            float nb = (float)curr_img[ny * width + nx];
+            float d2 = (float)(dx * dx + dy * dy);
+            float r = nb - center;
+            float w = exp(d2 * inv_2s2 + (r * r) * inv_2r2);
+            sum_w += w;
+            sum_v += w * nb;
+        }
+    }
+
+    // 2. Temporal 3x3 bilateral support from prev & next frames
+    for (int dy = -1; dy <= 1; dy++) {
+        int ny = clamp(y + dy, 0, height - 1);
+        for (int dx = -1; dx <= 1; dx++) {
+            int nx = clamp(x + dx, 0, width - 1);
+            int n_idx = ny * width + nx;
+            float d2 = (float)(dx * dx + dy * dy) + 1.0f;
+
+            float vp = (float)prev_img[n_idx];
+            float rp = vp - center;
+            float wp = 1.6f * exp(d2 * inv_2s2 + (rp * rp) * inv_2r2);
+            sum_w += wp;
+            sum_v += wp * vp;
+
+            float vn = (float)next_img[n_idx];
+            float rn = vn - center;
+            float wn = 1.6f * exp(d2 * inv_2s2 + (rn * rn) * inv_2r2);
+            sum_w += wn;
+            sum_v += wn * vn;
+        }
+    }
+
+    dst_img[idx] = (uchar)clamp(round(sum_v / max(sum_w, 1e-6f)), 0.0f, 255.0f);
 }
