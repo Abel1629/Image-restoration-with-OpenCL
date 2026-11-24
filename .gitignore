@@ -221,3 +221,32 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Virtual environments & Python cache
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# PyCharm IDE files
+.idea/
+
+# Media & generated datasets (keep folder structure via .gitkeep)
+data/clean/*
+data/degraded/*
+data/restored/*
+!data/**/.gitkeep
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.png
+*.jpg
+*.tif
+*.tiff
+
+# OS files
+Thumbs.db
+.DS_Store
